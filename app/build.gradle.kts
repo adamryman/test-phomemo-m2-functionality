@@ -10,7 +10,7 @@ android {
     }
 
     defaultConfig {
-        applicationId = "com.adamryman.snapandprint"
+        applicationId = "com.adamryman.phomemodebug"
         minSdk = 26
         targetSdk = 36
         versionCode = 1
@@ -35,9 +35,6 @@ dependencies {
     implementation(platform(libs.compose.bom))
     implementation(libs.compose.ui)
     implementation(libs.compose.material3)
-    implementation(libs.camera.core)
-    implementation(libs.camera.camera2)
-    implementation(libs.camera.lifecycle)
-    implementation(libs.camera.view)
     implementation(libs.androidx.exifinterface)
+    implementation(libs.zxing.core)
 }

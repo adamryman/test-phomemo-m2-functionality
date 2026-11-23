@@ -6,7 +6,6 @@ import android.graphics.Color
 import android.graphics.Matrix
 import android.graphics.Paint
 import android.graphics.Typeface
-import java.io.ByteArrayOutputStream
 import kotlin.math.min
 import kotlin.math.roundToInt
 
@@ -57,7 +56,15 @@ object ImageProcessor {
     }
 
     /** Grayscale → auto-levels → brightness/contrast → dither → pack. Input must be 384 px wide. */
-    fun process(bmp: Bitmap, brightness: Int, contrast: Int, dither: DitherStyle): ProcessedImage {
+    fun process(
+        bmp: Bitmap,
+        brightness: Int,
+        contrast: Int,
+        dither: DitherStyle,
+        threshold: Int = 128,
+        autoLevels: Boolean = true,
+    ): ProcessedImage {
+        val t = threshold.coerceIn(1, 254).toFloat()
         require(bmp.width == WIDTH) { "expected $WIDTH px wide, got ${bmp.width}" }
         val w = bmp.width
         val h = bmp.height
@@ -95,7 +102,7 @@ object ImageProcessor {
             if (!foundLo && cum >= loTarget) { lo = v; foundLo = true }
             if (cum >= hiTarget) { hi = v; break }
         }
-        if (hi - lo >= 16) {
+        if (autoLevels && hi - lo >= 16) {
             val k = 255f / (hi - lo)
             for (i in 0 until n) g[i] = ((g[i] - lo) * k).coerceIn(0f, 255f)
         }
@@ -109,12 +116,21 @@ object ImageProcessor {
         // 4. Dither to 1 bit. black[i] = true means a printed dot.
         val black = BooleanArray(n)
         when (dither) {
-            DitherStyle.THRESHOLD -> for (i in 0 until n) black[i] = g[i] < 128f
+            DitherStyle.THRESHOLD -> for (i in 0 until n) black[i] = g[i] < t
+            DitherStyle.ORDERED -> {
+                // 8x8 Bayer matrix; the threshold slider shifts the whole pattern.
+                val shift = t - 128f
+                for (y in 0 until h) for (x in 0 until w) {
+                    val i = y * w + x
+                    val m = (BAYER8[(y and 7) * 8 + (x and 7)] + 0.5f) / 64f * 255f + shift
+                    black[i] = g[i] < m
+                }
+            }
             DitherStyle.FLOYD_STEINBERG -> {
                 for (y in 0 until h) for (x in 0 until w) {
                     val i = y * w + x
                     val old = g[i]
-                    val isBlack = old < 128f
+                    val isBlack = old < t
                     black[i] = isBlack
                     val err = old - (if (isBlack) 0f else 255f)
                     if (x + 1 < w) g[i + 1] += err * 7f / 16f
@@ -129,7 +145,7 @@ object ImageProcessor {
                 for (y in 0 until h) for (x in 0 until w) {
                     val i = y * w + x
                     val old = g[i]
-                    val isBlack = old < 128f
+                    val isBlack = old < t
                     black[i] = isBlack
                     val e = (old - (if (isBlack) 0f else 255f)) / 8f
                     if (x + 1 < w) g[i + 1] += e
@@ -164,30 +180,12 @@ object ImageProcessor {
         return ProcessedImage(packed, h, preview)
     }
 
-    /** ESC/POS raster stream for the Phomemo M02. */
-    fun buildPrintStream(img: ProcessedImage, feed: Int): ByteArray {
-        val out = ByteArrayOutputStream(img.packed.size + 64)
-        fun put(vararg b: Int) = b.forEach { out.write(it and 0xFF) }
-        put(0x1B, 0x40)             // ESC @  init
-        put(0x1B, 0x61, 0x01)       // ESC a 1 center
-        put(0x1F, 0x11, 0x02, 0x04) // Phomemo start
-        var row = 0
-        while (row < img.height) {
-            val rows = min(255, img.height - row)
-            put(0x1D, 0x76, 0x30, 0x00)                  // GS v 0, mode 0
-            put(BYTES_PER_ROW and 0xFF, BYTES_PER_ROW shr 8) // width in bytes (LE)
-            put(rows and 0xFF, rows shr 8)               // height in rows (LE)
-            out.write(img.packed, row * BYTES_PER_ROW, rows * BYTES_PER_ROW)
-            row += rows
-        }
-        put(0x1B, 0x64, feed.coerceIn(0, 255)) // ESC d n feed
-        put(0x1B, 0x64, 0x02)
-        put(0x1F, 0x11, 0x08)
-        put(0x1F, 0x11, 0x0E)
-        put(0x1F, 0x11, 0x07)
-        put(0x1F, 0x11, 0x09)
-        return out.toByteArray()
-    }
+    private val BAYER8 = intArrayOf(
+        0, 32, 8, 40, 2, 34, 10, 42, 48, 16, 56, 24, 50, 18, 58, 26,
+        12, 44, 4, 36, 14, 46, 6, 38, 60, 28, 52, 20, 62, 30, 54, 22,
+        3, 35, 11, 43, 1, 33, 9, 41, 51, 19, 59, 27, 49, 17, 57, 25,
+        15, 47, 7, 39, 13, 45, 5, 37, 63, 31, 55, 23, 61, 29, 53, 21,
+    )
 
     /** A 384-px-wide test card: border, text, gray ramp, and fine patterns. */
     fun testCard(): Bitmap {
@@ -202,7 +200,7 @@ object ImageProcessor {
         p.style = Paint.Style.FILL
         p.typeface = Typeface.create(Typeface.DEFAULT, Typeface.BOLD)
         p.textSize = 44f; p.textAlign = Paint.Align.CENTER
-        cv.drawText("Snap & Print", w / 2f, 62f, p)
+        cv.drawText("M02 Debug", w / 2f, 62f, p)
         p.typeface = Typeface.DEFAULT; p.textSize = 22f
         cv.drawText("Phomemo M02 test print", w / 2f, 96f, p)
         // Gray ramp

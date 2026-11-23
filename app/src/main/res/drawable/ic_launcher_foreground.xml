@@ -2,11 +2,10 @@
 <vector xmlns:android="http://schemas.android.com/apk/res/android"
     android:width="108dp" android:height="108dp"
     android:viewportWidth="108" android:viewportHeight="108">
-    <!-- paper strip -->
-    <path android:fillColor="#FFFFFF" android:pathData="M40,58 h28 v22 h-28 z" />
-    <path android:fillColor="#111111" android:pathData="M44,64 h20 v2 h-20 z M44,70 h14 v2 h-14 z" />
-    <!-- camera body -->
-    <path android:fillColor="#FFFFFF" android:pathData="M30,38 h12 l4,-6 h16 l4,6 h12 v24 h-48 z" />
-    <path android:fillColor="#111111" android:pathData="M54,50 m-9,0 a9,9 0 1,0 18,0 a9,9 0 1,0 -18,0" />
-    <path android:fillColor="#FFFFFF" android:pathData="M54,50 m-5,0 a5,5 0 1,0 10,0 a5,5 0 1,0 -10,0" />
+    <!-- printer body -->
+    <path android:fillColor="#FFFFFF" android:pathData="M32,40 h44 v20 h-44 z" />
+    <path android:fillColor="#E65100" android:pathData="M38,48 h32 v4 h-32 z" />
+    <!-- paper with a test pattern -->
+    <path android:fillColor="#FFFFFF" android:pathData="M40,52 h28 v26 h-28 z" />
+    <path android:fillColor="#111111" android:pathData="M44,58 h4 v4 h-4 z M52,58 h4 v4 h-4 z M60,58 h4 v4 h-4 z M48,62 h4 v4 h-4 z M56,62 h4 v4 h-4 z M44,70 h20 v2 h-20 z" />
 </vector>

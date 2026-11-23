@@ -7,39 +7,33 @@ import android.content.pm.PackageManager
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
-import android.os.VibrationEffect
-import android.os.Vibrator
-import android.os.VibratorManager
 import android.provider.Settings
 import android.util.Log
-import android.view.KeyEvent
 import android.view.WindowManager
+import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.PickVisualMediaRequest
 import androidx.activity.result.contract.ActivityResultContracts
-import androidx.camera.core.ImageCapture
-import androidx.camera.core.ImageCaptureException
-import androidx.camera.core.ImageProxy
 import androidx.compose.runtime.getValue
-import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
 import androidx.core.content.ContextCompat
-import java.util.concurrent.Executors
+import androidx.core.content.FileProvider
+import java.io.File
+import kotlin.concurrent.thread
 
 class MainActivity : ComponentActivity() {
     val manager: PrintManager get() = (application as SnapApp).printManager
 
-    private val cameraExecutor = Executors.newSingleThreadExecutor()
-    var imageCapture: ImageCapture? = null
-
     var permissionsGranted by mutableStateOf(false)
     var permissionsDenied by mutableStateOf(false)
-    var showSettings by mutableStateOf(false)
     var showPicker by mutableStateOf(false)
-    var flashTick by mutableIntStateOf(0)
+    /** Current debug page; null = home screen. */
+    var page by mutableStateOf<LabPage?>(null)
+    /** Test Lab controls; kept here so values survive switching pages. */
+    val lab = LabState()
 
     private val permissionLauncher =
         registerForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) {
@@ -49,14 +43,16 @@ class MainActivity : ComponentActivity() {
             if (!was && permissionsGranted) onPermissionsGranted()
         }
 
-    private val storageLauncher =
-        registerForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
-            if (!granted) manager.settings.saveToGallery = false
+    private val labPickMedia =
+        registerForActivityResult(ActivityResultContracts.PickVisualMedia()) { uri: Uri? ->
+            if (uri != null) loadLabImage(uri)
         }
 
-    private val pickMedia =
-        registerForActivityResult(ActivityResultContracts.PickVisualMedia()) { uri: Uri? ->
-            if (uri != null) { feedback(); manager.submitUri(uri) }
+    private var labPhotoUri: Uri? = null
+    private val labTakePhoto =
+        registerForActivityResult(ActivityResultContracts.TakePicture()) { ok ->
+            val uri = labPhotoUri
+            if (ok && uri != null) loadLabImage(uri)
         }
 
     private val enableBluetooth =
@@ -80,13 +76,7 @@ class MainActivity : ComponentActivity() {
         if (!was && permissionsGranted) { permissionsDenied = false; onPermissionsGranted() }
     }
 
-    override fun onDestroy() {
-        super.onDestroy()
-        cameraExecutor.shutdown()
-    }
-
     fun requiredPermissions(): Array<String> = buildList {
-        add(Manifest.permission.CAMERA)
         if (Build.VERSION.SDK_INT >= 31) {
             add(Manifest.permission.BLUETOOTH_SCAN)
             add(Manifest.permission.BLUETOOTH_CONNECT)
@@ -123,76 +113,41 @@ class MainActivity : ComponentActivity() {
         try {
             enableBluetooth.launch(Intent(BluetoothAdapter.ACTION_REQUEST_ENABLE))
         } catch (e: Exception) {
-            Log.w("SnapPrint", "can't request bluetooth enable", e)
+            Log.w("PhomemoDebug", "can't request bluetooth enable", e)
         }
     }
 
-    fun pickFromGallery() {
-        pickMedia.launch(PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageOnly))
-    }
+    fun labPickImage() =
+        labPickMedia.launch(PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageOnly))
 
-    fun onSaveToGalleryToggled(on: Boolean) {
-        manager.settings.saveToGallery = on
-        if (on && Build.VERSION.SDK_INT < 29 &&
-            ContextCompat.checkSelfPermission(this, Manifest.permission.WRITE_EXTERNAL_STORAGE)
-            != PackageManager.PERMISSION_GRANTED
-        ) {
-            storageLauncher.launch(Manifest.permission.WRITE_EXTERNAL_STORAGE)
-        }
-    }
-
-    /** Shutter: capture and print. No preview, no confirm. */
-    fun shutter() {
-        val ic = imageCapture ?: return
-        feedback()
-        ic.takePicture(cameraExecutor, object : ImageCapture.OnImageCapturedCallback() {
-            override fun onCaptureSuccess(image: ImageProxy) {
-                try {
-                    val bmp = image.toBitmap()
-                    val rot = image.imageInfo.rotationDegrees
-                    manager.submitBitmap(bmp, rot)
-                } catch (t: Throwable) {
-                    Log.e("SnapPrint", "capture convert failed", t)
-                    manager.reportError("Camera error")
-                } finally {
-                    image.close()
-                }
-            }
-
-            override fun onError(exception: ImageCaptureException) {
-                Log.e("SnapPrint", "capture failed", exception)
-                manager.reportError("Camera error")
-            }
-        })
-    }
-
-    private fun feedback() {
-        flashTick++
+    /** Uses the system camera app, so this app needs no camera permission. */
+    fun labCapturePhoto() {
         try {
-            val vib: Vibrator? = if (Build.VERSION.SDK_INT >= 31) {
-                getSystemService(VibratorManager::class.java)?.defaultVibrator
-            } else {
-                @Suppress("DEPRECATION")
-                getSystemService(Vibrator::class.java)
-            }
-            vib?.vibrate(VibrationEffect.createOneShot(35, VibrationEffect.DEFAULT_AMPLITUDE))
-        } catch (_: Exception) { }
-    }
-
-    override fun onKeyDown(keyCode: Int, event: KeyEvent): Boolean {
-        if ((keyCode == KeyEvent.KEYCODE_VOLUME_UP || keyCode == KeyEvent.KEYCODE_VOLUME_DOWN) &&
-            permissionsGranted && !showSettings && !showPicker
-        ) {
-            if (event.repeatCount == 0) shutter()
-            return true
+            val dir = File(cacheDir, "lab").apply { mkdirs() }
+            val file = File(dir, "capture.jpg")
+            val uri = FileProvider.getUriForFile(this, "$packageName.labfiles", file)
+            labPhotoUri = uri
+            labTakePhoto.launch(uri)
+        } catch (e: Exception) {
+            Log.w("PhomemoDebug", "camera intent failed", e)
+            toast("No camera app available")
         }
-        return super.onKeyDown(keyCode, event)
     }
 
-    override fun onKeyUp(keyCode: Int, event: KeyEvent): Boolean {
-        if ((keyCode == KeyEvent.KEYCODE_VOLUME_UP || keyCode == KeyEvent.KEYCODE_VOLUME_DOWN) &&
-            permissionsGranted && !showSettings && !showPicker
-        ) return true
-        return super.onKeyUp(keyCode, event)
+    private fun loadLabImage(uri: Uri) {
+        val rotate = lab.rotateWide
+        thread(name = "lab-decode") {
+            try {
+                val bmp = manager.prepareUri(uri, rotate)
+                runOnUiThread { lab.image = bmp; lab.useImage = true }
+            } catch (t: Throwable) {
+                Log.w("PhomemoDebug", "lab decode failed", t)
+                runOnUiThread { toast("Couldn't open that image") }
+            }
+        }
+    }
+
+    fun toast(msg: String) {
+        runOnUiThread { Toast.makeText(this, msg, Toast.LENGTH_LONG).show() }
     }
 }

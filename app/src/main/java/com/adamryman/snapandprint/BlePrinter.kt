@@ -6,6 +6,7 @@ import android.bluetooth.BluetoothDevice
 import android.bluetooth.BluetoothGatt
 import android.bluetooth.BluetoothGattCallback
 import android.bluetooth.BluetoothGattCharacteristic
+import android.bluetooth.BluetoothGattDescriptor
 import android.bluetooth.BluetoothManager
 import android.bluetooth.BluetoothProfile
 import android.bluetooth.BluetoothStatusCodes
@@ -35,6 +36,7 @@ class BlePrinter(private val context: Context) {
     companion object {
         val SERVICE_UUID: UUID = UUID.fromString("0000ff00-0000-1000-8000-00805f9b34fb")
         val WRITE_UUID: UUID = UUID.fromString("0000ff02-0000-1000-8000-00805f9b34fb")
+        val CCCD_UUID: UUID = UUID.fromString("00002902-0000-1000-8000-00805f9b34fb")
         val NAME_PREFIXES = listOf("Mr.in", "M02", "M0", "T0", "Phomemo")
         fun looksLikePrinter(name: String?) =
             name != null && NAME_PREFIXES.any { name.startsWith(it, ignoreCase = true) }
@@ -51,6 +53,21 @@ class BlePrinter(private val context: Context) {
 
     /** Called (on a binder thread) whenever an established link drops. */
     var onDisconnected: (() -> Unit)? = null
+    /** Notifications/indications from the printer (binder thread). */
+    var onReceive: ((UUID, ByteArray) -> Unit)? = null
+    /** Human-readable connection events for the diagnostics log. */
+    var onInfo: ((String) -> Unit)? = null
+
+    @Volatile var address: String? = null; private set
+    @Volatile var writeUuid: UUID? = null; private set
+    @Volatile var writeNoResponse: Boolean = false; private set
+    @Volatile var notifyUuids: List<UUID> = emptyList(); private set
+    @Volatile var gattTable: List<String> = emptyList(); private set
+
+    @Volatile private var descWait: CompletableDeferred<Int>? = null
+    @Volatile private var readWait: CompletableDeferred<ByteArray?>? = null
+
+    private fun info(msg: String) { Log.i(TAG, msg); onInfo?.invoke(msg) }
 
     @Volatile private var connectWait: CompletableDeferred<Boolean>? = null
     @Volatile private var servicesWait: CompletableDeferred<Boolean>? = null
@@ -73,7 +90,7 @@ class BlePrinter(private val context: Context) {
                 writeWait?.complete(-1)
                 runCatching { g.close() }
                 if (gatt === g) { gatt = null; writeChar = null }
-                if (wasReady) onDisconnected?.invoke()
+                if (wasReady) { onInfo?.invoke("disconnected (status $status)"); onDisconnected?.invoke() }
             }
         }
 
@@ -88,6 +105,32 @@ class BlePrinter(private val context: Context) {
 
         override fun onCharacteristicWrite(g: BluetoothGatt, c: BluetoothGattCharacteristic, status: Int) {
             writeWait?.complete(status)
+        }
+
+        override fun onDescriptorWrite(g: BluetoothGatt, d: BluetoothGattDescriptor, status: Int) {
+            descWait?.complete(status)
+        }
+
+        // API 33+
+        override fun onCharacteristicChanged(g: BluetoothGatt, c: BluetoothGattCharacteristic, value: ByteArray) {
+            onReceive?.invoke(c.uuid, value)
+        }
+
+        @Deprecated("Deprecated in Java")
+        @Suppress("DEPRECATION")
+        override fun onCharacteristicChanged(g: BluetoothGatt, c: BluetoothGattCharacteristic) {
+            onReceive?.invoke(c.uuid, c.value?.copyOf() ?: ByteArray(0))
+        }
+
+        // API 33+
+        override fun onCharacteristicRead(g: BluetoothGatt, c: BluetoothGattCharacteristic, value: ByteArray, status: Int) {
+            readWait?.complete(if (status == BluetoothGatt.GATT_SUCCESS) value else null)
+        }
+
+        @Deprecated("Deprecated in Java")
+        @Suppress("DEPRECATION")
+        override fun onCharacteristicRead(g: BluetoothGatt, c: BluetoothGattCharacteristic, status: Int) {
+            readWait?.complete(if (status == BluetoothGatt.GATT_SUCCESS) c.value?.copyOf() else null)
         }
     }
 
@@ -120,30 +163,91 @@ class BlePrinter(private val context: Context) {
 
         var chosen: BluetoothGattCharacteristic? = null
         var fallback: BluetoothGattCharacteristic? = null
+        val notifiable = mutableListOf<BluetoothGattCharacteristic>()
+        val table = mutableListOf<String>()
         for (s in g.services) {
             Log.i(TAG, "service ${s.uuid}")
+            table += "service ${s.uuid}"
             for (c in s.characteristics) {
                 val p = c.properties
                 val canWrite = p and (BluetoothGattCharacteristic.PROPERTY_WRITE or
                         BluetoothGattCharacteristic.PROPERTY_WRITE_NO_RESPONSE) != 0
+                if (p and (BluetoothGattCharacteristic.PROPERTY_NOTIFY or BluetoothGattCharacteristic.PROPERTY_INDICATE) != 0) {
+                    notifiable += c
+                }
                 Log.i(TAG, "   char ${c.uuid} props=0x${p.toString(16)} writable=$canWrite")
+                table += "  char ${c.uuid} [${propNames(p)}]"
                 if (s.uuid == SERVICE_UUID && c.uuid == WRITE_UUID) chosen = c
                 if (canWrite && fallback == null) fallback = c
             }
         }
         val wc = chosen ?: fallback
         if (wc == null) { Log.w(TAG, "no writable characteristic"); closeGatt(g); return false }
-        Log.i(TAG, "using characteristic ${wc.uuid} (preferred=${chosen != null})")
+        info("using characteristic ${wc.uuid} (preferred=${chosen != null})")
         writeChar = wc
+        writeUuid = wc.uuid
+        writeNoResponse = wc.properties and BluetoothGattCharacteristic.PROPERTY_WRITE_NO_RESPONSE != 0
+        gattTable = table
+        this.address = address
 
         // Bigger MTU.
         val mw = CompletableDeferred<Int>().also { mtuWait = it }
         mtu = if (g.requestMtu(512)) withTimeoutOrNull(4_000) { mw.await() } ?: 23 else 23
-        Log.i(TAG, "using MTU $mtu")
+        info("using MTU $mtu")
         if (gatt !== g) return false // dropped meanwhile
+
+        // Subscribe to every notify/indicate characteristic so status replies show up in the log.
+        val subscribed = mutableListOf<UUID>()
+        for (c in notifiable) {
+            if (enableNotify(g, c)) subscribed += c.uuid
+        }
+        notifyUuids = subscribed
+        info(if (subscribed.isEmpty()) "no notify characteristics" else "notifications on ${subscribed.joinToString()}")
+        if (gatt !== g) return false
         noResponseCallbacksWork = true
         isReady = true
         return true
+    }
+
+    private fun propNames(p: Int): String = buildList {
+        if (p and BluetoothGattCharacteristic.PROPERTY_READ != 0) add("read")
+        if (p and BluetoothGattCharacteristic.PROPERTY_WRITE != 0) add("write")
+        if (p and BluetoothGattCharacteristic.PROPERTY_WRITE_NO_RESPONSE != 0) add("writeNoResp")
+        if (p and BluetoothGattCharacteristic.PROPERTY_NOTIFY != 0) add("notify")
+        if (p and BluetoothGattCharacteristic.PROPERTY_INDICATE != 0) add("indicate")
+    }.joinToString(",")
+
+    @Suppress("DEPRECATION")
+    private suspend fun enableNotify(g: BluetoothGatt, c: BluetoothGattCharacteristic): Boolean = try {
+        g.setCharacteristicNotification(c, true)
+        val d = c.getDescriptor(CCCD_UUID)
+        if (d == null) true else {
+            val value = if (c.properties and BluetoothGattCharacteristic.PROPERTY_NOTIFY != 0)
+                BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE else BluetoothGattDescriptor.ENABLE_INDICATION_VALUE
+            val w = CompletableDeferred<Int>().also { descWait = it }
+            val started = if (Build.VERSION.SDK_INT >= 33) {
+                g.writeDescriptor(d, value) == BluetoothStatusCodes.SUCCESS
+            } else {
+                d.value = value
+                g.writeDescriptor(d)
+            }
+            started && withTimeoutOrNull(2_000) { w.await() } == BluetoothGatt.GATT_SUCCESS
+        }
+    } catch (e: SecurityException) { false }
+
+    /** Reads every readable characteristic (device info, etc.). For the probe. */
+    @Suppress("DEPRECATION")
+    suspend fun readAll(): List<Pair<UUID, ByteArray?>> {
+        val g = gatt ?: return emptyList()
+        val out = mutableListOf<Pair<UUID, ByteArray?>>()
+        for (s in g.services) for (c in s.characteristics) {
+            if (c.properties and BluetoothGattCharacteristic.PROPERTY_READ == 0) continue
+            if (!isReady || out.size >= 16) break
+            val w = CompletableDeferred<ByteArray?>().also { readWait = it }
+            val started = try { g.readCharacteristic(c) } catch (e: SecurityException) { false }
+            out += c.uuid to (if (started) withTimeoutOrNull(2_000) { w.await() } else null)
+        }
+        return out
     }
 
     fun disconnect() {

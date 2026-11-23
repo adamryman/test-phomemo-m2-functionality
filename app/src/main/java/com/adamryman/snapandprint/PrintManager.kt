@@ -1,20 +1,15 @@
 package com.adamryman.snapandprint
 
-import android.content.ContentValues
 import android.content.Context
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
-import android.graphics.Matrix
 import android.net.Uri
-import android.os.Build
-import android.provider.MediaStore
 import android.util.Log
 import androidx.exifinterface.media.ExifInterface
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
-import kotlinx.coroutines.asCoroutineDispatcher
 import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -24,8 +19,7 @@ import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
-import java.util.concurrent.Executors
-import java.util.concurrent.atomic.AtomicInteger
+import kotlin.math.roundToInt
 
 private const val TAG = "SnapPrint"
 
@@ -38,17 +32,30 @@ sealed class PrinterStatus {
     data class Error(val message: String, val bluetoothOff: Boolean = false) : PrinterStatus()
 }
 
-private class PrintJob(val data: ByteArray)
+/**
+ * One unit of work for the printer. Either [data] is streamed, or [run] does custom GATT work
+ * (e.g. the probe). Jobs are executed strictly one at a time, in order.
+ */
+private class PrintJob(
+    val label: String,
+    val data: ByteArray,
+    val run: (suspend () -> Boolean)? = null,
+)
+
+enum class LogDir(val arrow: String) { TX("→"), RX("←"), INFO("•") }
+
+data class LogEntry(val timeMs: Long, val dir: LogDir, val text: String)
+
+data class JobResult(val label: String, val bytes: Int, val millis: Long, val ok: Boolean, val atMs: Long) {
+    val kbPerSec: Float get() = if (millis > 0) bytes / 1024f / (millis / 1000f) else 0f
+}
 
 /** Owns the printer connection and the print queue. Lives for the whole process. */
 class PrintManager(private val context: Context) {
     val settings = AppSettings(context)
     private val printer = BlePrinter(context)
+    val protocol: PrinterProtocol = PhomemoM02
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
-
-    /** Single thread so photos are processed (and therefore printed) in shutter order. */
-    private val processing = Executors.newSingleThreadExecutor().asCoroutineDispatcher()
-    private val processingCount = AtomicInteger(0)
 
     private val queue = ArrayDeque<PrintJob>()
     private val wake = Channel<Unit>(Channel.CONFLATED)
@@ -61,11 +68,8 @@ class PrintManager(private val context: Context) {
     val status: StateFlow<PrinterStatus> = _status.asStateFlow()
 
     private val _pending = MutableStateFlow(0)
-    /** Photos waiting: being processed + queued + currently printing. */
+    /** Jobs waiting: queued + currently printing. */
     val pending: StateFlow<Int> = _pending.asStateFlow()
-
-    private val _thumbnail = MutableStateFlow<Bitmap?>(null)
-    val thumbnail: StateFlow<Bitmap?> = _thumbnail.asStateFlow()
 
     private val _devices = MutableStateFlow<List<FoundDevice>>(emptyList())
     val devices: StateFlow<List<FoundDevice>> = _devices.asStateFlow()
@@ -77,17 +81,56 @@ class PrintManager(private val context: Context) {
 
     val hasPrinter: Boolean get() = settings.printerAddress != null
 
+    // ---- Diagnostics state (Test Lab) ----
+
+    private val _log = MutableStateFlow<List<LogEntry>>(emptyList())
+    val log: StateFlow<List<LogEntry>> = _log.asStateFlow()
+
+    private val _facts = MutableStateFlow<Map<String, String>>(emptyMap())
+    /** Parsed printer replies: battery, paper, firmware… */
+    val facts: StateFlow<Map<String, String>> = _facts.asStateFlow()
+
+    private val _results = MutableStateFlow<List<JobResult>>(emptyList())
+    val results: StateFlow<List<JobResult>> = _results.asStateFlow()
+
+    val connectionInfo: List<Pair<String, String>>
+        get() = listOf(
+            "Printer" to (settings.printerName ?: "none"),
+            "Address" to (printer.address ?: settings.printerAddress ?: "—"),
+            "Link" to if (printer.isReady) "connected" else "not connected",
+            "MTU" to "${printer.mtu} (payload ${printer.mtu - 3})",
+            "Write char" to (printer.writeUuid?.toString()?.substring(4, 8) ?: "—") +
+                if (printer.writeNoResponse) " (no-response)" else " (with response)",
+            "Notify chars" to printer.notifyUuids.joinToString { it.toString().substring(4, 8) }.ifEmpty { "—" },
+            "Packet / delay" to "${settings.packetSize} B / ${settings.packetDelayMs} ms",
+        )
+    val gattTable: List<String> get() = printer.gattTable
+
+    fun addLog(dir: LogDir, text: String) {
+        val e = LogEntry(System.currentTimeMillis(), dir, text)
+        _log.update { (it + e).takeLast(600) }
+    }
+
+    fun clearLog() { _log.value = emptyList() }
+
     init {
         printer.onDisconnected = {
             Log.i(TAG, "printer disconnected")
             if (!printing) setIdleStatus()
+        }
+        printer.onInfo = { addLog(LogDir.INFO, it) }
+        printer.onReceive = { uuid, bytes ->
+            val facts = protocol.parse(bytes)
+            val meaning = if (facts.isEmpty()) "" else "  = " + facts.joinToString { "${it.first}: ${it.second}" }
+            addLog(LogDir.RX, "[${uuid.toString().substring(4, 8)}] ${bytes.toHex(64)}$meaning")
+            if (facts.isNotEmpty()) _facts.update { it + facts }
         }
         scope.launch { worker() }
     }
 
     private fun updatePending() {
         val q = synchronized(queue) { queue.size }
-        _pending.value = processingCount.get() + q
+        _pending.value = q
     }
 
     private fun setIdleStatus() {
@@ -98,59 +141,66 @@ class PrintManager(private val context: Context) {
         }
     }
 
-    // ---- Submitting photos ----
+    // ---- Test Lab ----
 
-    /** A frame from the camera. [rotationDegrees] comes from the ImageProxy (EXIF-equivalent). */
-    fun submitBitmap(src: Bitmap, rotationDegrees: Int) {
-        processingCount.incrementAndGet(); updatePending()
-        val s = settings
-        scope.launch(processing) {
-            try {
-                if (s.saveToGallery) saveColorPhoto(src, rotationDegrees)
-                val prepared = ImageProcessor.prepare(src, rotationDegrees, false, s.rotateWide)
-                enqueueProcessed(prepared)
-            } catch (t: Throwable) {
-                Log.e(TAG, "processing failed", t)
-                _status.value = PrinterStatus.Error("Couldn't process photo")
-            } finally {
-                processingCount.decrementAndGet(); updatePending()
+    /** Queues a protocol command. Returns null if queued, or the reason it can't be sent. */
+    fun submitCommand(label: String, cmd: Cmd): String? = when (cmd) {
+        is Cmd.Unsupported -> {
+            addLog(LogDir.INFO, "$label: not sent — ${cmd.reason}")
+            cmd.reason
+        }
+        is Cmd.Bytes -> {
+            synchronized(queue) { queue.addLast(PrintJob(label, cmd.data)) }
+            updatePending()
+            wake.trySend(Unit)
+            null
+        }
+    }
+
+    /** Sends each status query separately, collects notifications, then reads readable chars. */
+    fun probe() {
+        val queries = protocol.queries()
+        val job = PrintJob("probe", ByteArray(0)) {
+            for (q in queries) {
+                addLog(LogDir.TX, "${q.label}: ${q.bytes.toHex()}")
+                if (!printer.write(q.bytes, settings.packetSize, 0) {}) return@PrintJob false
+                delay(450) // give the printer time to answer before the next query
             }
-        }
-    }
-
-    /** A photo picked from the gallery. */
-    fun submitUri(uri: Uri) {
-        processingCount.incrementAndGet(); updatePending()
-        scope.launch(processing) {
-            try {
-                val (bmp, rot, flip) = decodeUri(uri)
-                val prepared = ImageProcessor.prepare(bmp, rot, flip, settings.rotateWide)
-                enqueueProcessed(prepared)
-            } catch (t: Throwable) {
-                Log.e(TAG, "gallery decode failed", t)
-                _status.value = PrinterStatus.Error("Couldn't open that photo")
-            } finally {
-                processingCount.decrementAndGet(); updatePending()
+            for ((uuid, value) in printer.readAll()) {
+                val short = uuid.toString().substring(4, 8)
+                if (value == null) addLog(LogDir.RX, "read [$short] failed")
+                else {
+                    val ascii = String(value, Charsets.US_ASCII).filter { it.code in 32..126 }
+                    addLog(LogDir.RX, "read [$short] ${value.toHex(48)}" + if (ascii.length >= 2) "  \"$ascii\"" else "")
+                    val shown = if (short == "2a19" && value.isNotEmpty()) "${value[0].toInt() and 0xFF}%" else ascii
+                    knownCharName(short)?.let { name -> if (shown.isNotEmpty()) _facts.update { it + (name to shown) } }
+                }
             }
+            true
         }
-    }
-
-    fun testPrint() {
-        processingCount.incrementAndGet(); updatePending()
-        scope.launch(processing) {
-            try { enqueueProcessed(ImageProcessor.testCard()) }
-            finally { processingCount.decrementAndGet(); updatePending() }
-        }
-    }
-
-    private fun enqueueProcessed(prepared: Bitmap) {
-        val s = settings
-        val img = ImageProcessor.process(prepared, s.brightness, s.contrast, s.dither)
-        _thumbnail.value = img.preview
-        val data = ImageProcessor.buildPrintStream(img, s.feed)
-        synchronized(queue) { queue.addLast(PrintJob(data)) }
+        synchronized(queue) { queue.addLast(job) }
         updatePending()
         wake.trySend(Unit)
+    }
+
+    private fun knownCharName(short: String) = when (short.lowercase()) {
+        "2a00" -> "Device name"; "2a24" -> "Model"; "2a25" -> "Serial (DIS)"; "2a26" -> "Firmware (DIS)"
+        "2a27" -> "Hardware"; "2a28" -> "Software"; "2a29" -> "Manufacturer"; "2a19" -> "Battery (BAS)"
+        else -> null
+    }
+
+    fun disconnectNow() {
+        scope.launch {
+            connectMutex.withLock { printer.disconnect() }
+            addLog(LogDir.INFO, "disconnected by user")
+            setIdleStatus()
+        }
+    }
+
+    /** Decodes a picked/captured photo to a 384-px-wide bitmap (off the main thread). */
+    fun prepareUri(uri: Uri, rotateWide: Boolean): Bitmap {
+        val (bmp, rot, flip) = decodeUri(uri)
+        return ImageProcessor.prepare(bmp, rot, flip, rotateWide)
     }
 
     fun clearQueue() {
@@ -176,19 +226,32 @@ class PrintManager(private val context: Context) {
             }
             printing = true
             _status.value = PrinterStatus.Printing(0f)
+            if (job.run == null) addLog(LogDir.TX, "${job.label}: ${job.data.toHex(48)}")
+            val started = System.currentTimeMillis()
+            var nextMark = 0.25f
             val ok = try {
-                printer.write(job.data, settings.packetSize, settings.packetDelayMs) { p ->
+                job.run?.invoke() ?: printer.write(job.data, settings.packetSize, settings.packetDelayMs) { p ->
                     _status.value = PrinterStatus.Printing(p)
+                    if (job.data.size > 20_000 && p >= nextMark) {
+                        val ms = System.currentTimeMillis() - started
+                        val kbs = job.data.size * p / 1024f / (ms.coerceAtLeast(1) / 1000f)
+                        addLog(LogDir.INFO, "${job.label}: ${(p * 100).roundToInt()}% after $ms ms (%.1f KB/s)".format(kbs))
+                        nextMark += 0.25f
+                    }
                 }
             } catch (t: Throwable) {
                 Log.e(TAG, "print failed", t); false
             }
+            val elapsed = System.currentTimeMillis() - started
             printing = false
+            val result = JobResult(job.label, job.data.size, elapsed, ok, System.currentTimeMillis())
+            _results.update { (listOf(result) + it).take(50) }
+            addLog(LogDir.INFO, "${job.label}: ${if (ok) "sent" else "FAILED"} in $elapsed ms")
             if (ok) {
                 synchronized(queue) { if (queue.firstOrNull() === job) queue.removeFirst() }
                 updatePending()
                 setIdleStatus()
-                // Let the print head catch up before streaming the next photo.
+                // Let the print head catch up before streaming the next job.
                 if (synchronized(queue) { queue.isNotEmpty() }) delay(1_000)
             } else {
                 Log.w(TAG, "print failed; keeping job in queue")
@@ -302,34 +365,5 @@ class PrintManager(private val context: Context) {
         val bmp = cr.openInputStream(uri)?.use { BitmapFactory.decodeStream(it, null, opts) }
             ?: error("decode failed")
         return Triple(bmp, rot, flip)
-    }
-
-    private fun saveColorPhoto(src: Bitmap, rotationDegrees: Int) {
-        try {
-            val bmp = if (rotationDegrees % 360 != 0) {
-                val m = Matrix().apply { postRotate(rotationDegrees.toFloat()) }
-                Bitmap.createBitmap(src, 0, 0, src.width, src.height, m, true)
-            } else src
-            val name = "snap_${System.currentTimeMillis()}.jpg"
-            val values = ContentValues().apply {
-                put(MediaStore.Images.Media.DISPLAY_NAME, name)
-                put(MediaStore.Images.Media.MIME_TYPE, "image/jpeg")
-                if (Build.VERSION.SDK_INT >= 29) {
-                    put(MediaStore.Images.Media.RELATIVE_PATH, "Pictures/SnapAndPrint")
-                    put(MediaStore.Images.Media.IS_PENDING, 1)
-                }
-            }
-            val cr = context.contentResolver
-            val uri = cr.insert(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, values) ?: return
-            cr.openOutputStream(uri)?.use { bmp.compress(Bitmap.CompressFormat.JPEG, 92, it) }
-            if (Build.VERSION.SDK_INT >= 29) {
-                values.clear()
-                values.put(MediaStore.Images.Media.IS_PENDING, 0)
-                cr.update(uri, values, null, null)
-            }
-            if (bmp !== src) bmp.recycle()
-        } catch (t: Throwable) {
-            Log.w(TAG, "save to gallery failed", t)
-        }
     }
 }
