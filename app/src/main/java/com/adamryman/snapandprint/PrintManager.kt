@@ -19,6 +19,7 @@ import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
+import java.util.Locale
 import kotlin.math.roundToInt
 
 private const val TAG = "SnapPrint"
@@ -233,10 +234,14 @@ class PrintManager(private val context: Context) {
                 job.run?.invoke() ?: printer.write(job.data, settings.packetSize, settings.packetDelayMs) { p ->
                     _status.value = PrinterStatus.Printing(p)
                     if (job.data.size > 20_000 && p >= nextMark) {
-                        val ms = System.currentTimeMillis() - started
-                        val kbs = job.data.size * p / 1024f / (ms.coerceAtLeast(1) / 1000f)
-                        addLog(LogDir.INFO, "${job.label}: ${(p * 100).roundToInt()}% after $ms ms (%.1f KB/s)".format(kbs))
                         nextMark += 0.25f
+                        // Diagnostics only: must never abort the transfer.
+                        runCatching {
+                            val ms = System.currentTimeMillis() - started
+                            val kbs = job.data.size * p / 1024f / (ms.coerceAtLeast(1) / 1000f)
+                            val rate = String.format(Locale.US, "%.1f", kbs)
+                            addLog(LogDir.INFO, "${job.label}: ${(p * 100).roundToInt()}% after $ms ms ($rate KB/s)")
+                        }
                     }
                 }
             } catch (t: Throwable) {
@@ -247,17 +252,20 @@ class PrintManager(private val context: Context) {
             val result = JobResult(job.label, job.data.size, elapsed, ok, System.currentTimeMillis())
             _results.update { (listOf(result) + it).take(50) }
             addLog(LogDir.INFO, "${job.label}: ${if (ok) "sent" else "FAILED"} in $elapsed ms")
+            // Always take the job off the queue. A failed job is dropped (and logged) rather than
+            // retried, so one bad job can never block or be replayed in front of later ones.
+            synchronized(queue) { if (queue.firstOrNull() === job) queue.removeFirst() }
+            updatePending()
             if (ok) {
-                synchronized(queue) { if (queue.firstOrNull() === job) queue.removeFirst() }
-                updatePending()
                 setIdleStatus()
                 // Let the print head catch up before streaming the next job.
                 if (synchronized(queue) { queue.isNotEmpty() }) delay(1_000)
             } else {
-                Log.w(TAG, "print failed; keeping job in queue")
+                Log.w(TAG, "job '${job.label}' failed; dropped")
                 printer.disconnect()
-                _status.value = PrinterStatus.Error("Printer off? Tap to reconnect")
-                wake.receive()
+                _status.value = PrinterStatus.Error("${job.label} failed · tap to reconnect")
+                // Remaining jobs wait for a reconnect tap or a new job.
+                if (synchronized(queue) { queue.isNotEmpty() }) wake.receive()
             }
         }
     }
